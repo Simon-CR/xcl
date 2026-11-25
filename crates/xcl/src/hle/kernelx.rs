@@ -1206,6 +1206,14 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     Ok(true)
 }
 
+fn alloc_physical_home_block(u: &crate::gpu::uma::Uma, bytes: usize) -> Option<usize> {
+    if u.has_sparse() {
+        u.sparse_alloc(bytes, PHYS_PAGE).map(|(p, _)| p)
+    } else {
+        u.alloc(bytes, PHYS_PAGE).map(|p| p as usize)
+    }
+}
+
 pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, num: *mut usize, arr: *mut usize) -> BOOL {
     if num.is_null() || arr.is_null() || *num == 0 {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -1223,7 +1231,7 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
     // (a sparse or plain home is committed when it is used: `home_again`); without room in
     // unified memory plain memory (pages mapped into the title's own reservations never use
     // their home: a retail game's 6.1 GB of them did not fit next to its GPU heaps)
-    let block = u.sparse_alloc(bytes, PHYS_PAGE).map(|(p, _)| p).or_else(|| u.alloc(bytes, PHYS_PAGE).map(|p| p as usize)).or_else(|| {
+    let block = alloc_physical_home_block(u, bytes).or_else(|| {
         let p = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| crate::xlog_info!("AllocateTitlePhysicalPages({n}): no room in unified memory – their home is plain memory"));
@@ -3079,5 +3087,40 @@ mod tests {
             assert_eq!(mirrors::source(gpu as usize + 0x2_0000), None);
             assert_eq!(VirtualFree(cpu, 0, mem::MEM_RELEASE), 1);
         }
+    }
+
+    #[test]
+    fn physical_home_block_does_not_spill_into_coherent_when_sparse_enabled() {
+        let g = crate::gpu::uma::GRAIN;
+        let Some(u) = crate::gpu::uma::Uma::for_runtime_with(g * 4, g * 4) else {
+            return crate::gpu::recomp::runner::skip_test("no virtual address space");
+        };
+        assert!(u.has_sparse());
+        let coherent_before = u.used();
+
+        // Exhaust sparse windows via zero-commit reservations so `u.sparse_alloc(PHYS_PAGE, PHYS_PAGE)` fails.
+        let mut reserved = Vec::new();
+        while let Some(r) = u.sparse_reserve(1usize << 30) {
+            reserved.push(r);
+        }
+        while let Some((p, _)) = u.sparse_alloc(PHYS_PAGE, PHYS_PAGE) {
+            reserved.push(p);
+        }
+        assert!(u.sparse_alloc(PHYS_PAGE, PHYS_PAGE).is_none());
+
+        assert_eq!(
+            alloc_physical_home_block(&u, PHYS_PAGE),
+            None,
+            "failed sparse physical home allocation must never spill into coherent UMA"
+        );
+        assert_eq!(u.used(), coherent_before, "coherent UMA must stay untouched when sparse is enabled");
+
+        for r in reserved {
+            let _ = u.sparse_release(r);
+        }
+        let ok = alloc_physical_home_block(&u, PHYS_PAGE).expect("sparse physical home succeeds once sparse space is free");
+        assert!(u.is_sparse(ok));
+        let _ = u.sparse_release(ok);
+        assert_eq!(u.used(), coherent_before);
     }
 }
